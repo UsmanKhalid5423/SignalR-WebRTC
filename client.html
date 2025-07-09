@@ -1,0 +1,224 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>Client - Call Support</title>
+  <style>
+    body { font-family: Arial; text-align: center; margin-top: 30px; background-color: #f4f4f9; }
+    h2 { color: black; }
+    .video-container { display: none; margin-top: 20px; }
+    video { width: 50%; max-width: 400px; border-radius: 8px; border: 2px solid #bbb; }
+    #callButton { padding: 20px; background-color: green; color: white; font-size: 32px; border: none; border-radius: 50%; cursor: pointer; }
+    #callButton:hover { background-color: #3f51b5; }
+    #loadingIndicator { display: none; margin-top: 20px; }
+    #statusMessage { margin-top: 15px; font-size: 16px; color: #ff7043; }
+    .status-success { color: #388e3c; }
+    .status-error { color: #e53935; }
+    .status-info { color: #0288d1; }
+    #callDuration { font-size: 20px; color: #388e3c; }
+  </style>
+</head>
+<body>
+  <h2>Client: Call Support</h2>
+  <button id="callButton"><i class="fas fa-phone-alt"></i></button>
+  <button id="endCallButton" style="display:none; background-color: red; color: white;">End Call</button>
+
+  <div id="loadingIndicator"><p>Connecting...</p></div>
+  <div class="video-container">
+    <video id="localVideo" autoplay muted style="display: none;"></video>
+    <video id="remoteVideo" autoplay style="display: none;"></video>
+  </div>
+  <div id="callDuration"></div>
+  <div id="statusMessage"></div>
+
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/microsoft-signalr/7.0.5/signalr.min.js"></script>
+  <script>
+    const callButton = document.getElementById("callButton");
+    const endCallButton = document.getElementById("endCallButton");
+    const loadingIndicator = document.getElementById("loadingIndicator");
+    const videoContainer = document.querySelector(".video-container");
+    const statusMessage = document.getElementById("statusMessage");
+    const localVideo = document.getElementById("localVideo");
+    const remoteVideo = document.getElementById("remoteVideo");
+    const callDuration = document.getElementById("callDuration");
+
+    let localStream, peerConnection;
+    let callTimerInterval;
+    let callTime = 0;
+    let callTimeout;
+    let ringingAudio;
+    let totalAdmins = 0;
+    let adminRejectCount = 0;
+
+    const connection = new signalR.HubConnectionBuilder()
+      .withUrl("https://localhost:7035/callhub?role=client")
+      .configureLogging(signalR.LogLevel.Information)
+      .build();
+
+    const iceServers = { iceServers: [{ urls: "stun:stun.l.google.com:19302" }] };
+
+    async function initLocalMedia() {
+      try {
+        localStream = await navigator.mediaDevices.getUserMedia({ video: false, audio: true });
+        localVideo.srcObject = localStream;
+      } catch (err) {
+        showStatus("Microphone access error.", "error");
+      }
+    }
+
+    async function createPeerConnection() {
+      peerConnection = new RTCPeerConnection(iceServers);
+
+      peerConnection.onicecandidate = (event) => {
+        if (event.candidate) {
+          connection.invoke("SendIceCandidate", "admin", event.candidate);
+        }
+      };
+
+      peerConnection.ontrack = (event) => {
+        remoteVideo.srcObject = event.streams[0];
+      };
+
+      localStream.getTracks().forEach(track => {
+        peerConnection.addTrack(track, localStream);
+      });
+    }
+
+    callButton.onclick = async () => {
+      callButton.disabled = true;
+      loadingIndicator.style.display = "block";
+      showStatus("Calling...", "info");
+      adminRejectCount = 0; // reset counter
+      totalAdmins = 0;
+
+      await initLocalMedia();
+      await createPeerConnection();
+
+      callTimeout = setTimeout(() => {
+        showStatus("No admin available.", "error", 3000);
+        disconnectCall();
+      }, 5000);
+
+      try {
+        const offer = await peerConnection.createOffer();
+        await peerConnection.setLocalDescription(offer);
+        await connection.invoke("CallUser", "admin", offer);
+      } catch (error) {
+        showStatus("Call initiation failed.", "error");
+        clearTimeout(callTimeout);
+      }
+    };
+
+    function showStatus(msg, type, hideAfter = 0) {
+      statusMessage.textContent = msg;
+      statusMessage.className = `status-${type}`;
+      if (hideAfter) setTimeout(() => { statusMessage.textContent = ''; }, hideAfter);
+    }
+
+    function startCallTimer() {
+      callTime = 0;
+      callTimerInterval = setInterval(() => {
+        callTime++;
+        const min = Math.floor(callTime / 60);
+        const sec = callTime % 60;
+        callDuration.textContent = `Call Duration: ${min}:${sec < 10 ? '0' : ''}${sec}`;
+      }, 1000);
+    }
+
+    function stopCallTimer() {
+      clearInterval(callTimerInterval);
+      callDuration.textContent = "";
+    }
+
+    function disconnectCall() {
+      if (ringingAudio) {
+        ringingAudio.pause();
+        ringingAudio.currentTime = 0;
+      }
+      stopCallTimer();
+      loadingIndicator.style.display = "none";
+      videoContainer.style.display = "none";
+      callButton.disabled = false;
+    }
+
+    connection.on("Error", (msg) => {
+      showStatus(msg, "error");
+    });
+
+    // ❗ Receive how many admins were sent the call
+    connection.on("Ringing", (adminCount) => {
+      totalAdmins = adminCount || 0;
+      showStatus("Ringing admins...", "info");
+      clearTimeout(callTimeout);
+
+      ringingAudio = new Audio("ringing.mp3");
+      ringingAudio.loop = true;
+      ringingAudio.play().catch(err => console.warn("Audio error:", err));
+    });
+
+    connection.on("ReceiveAnswer", async (fromUserId, answer) => {
+      if (ringingAudio) ringingAudio.pause();
+      await peerConnection.setRemoteDescription(new RTCSessionDescription(answer));
+      loadingIndicator.style.display = "none";
+      videoContainer.style.display = "block";
+      callButton.style.display = "none";
+      endCallButton.style.display = "inline-block";
+      showStatus("", "info");
+      startCallTimer();
+    });
+
+    connection.on("ReceiveCandidate", async (fromUserId, candidate) => {
+      if (candidate) {
+        await peerConnection.addIceCandidate(new RTCIceCandidate(candidate));
+      }
+    });
+
+    connection.on("CallDeclined", () => {
+      adminRejectCount++;
+
+      if (adminRejectCount >= totalAdmins) {
+        if (ringingAudio) {
+          ringingAudio.pause();
+          ringingAudio.currentTime = 0;
+        }
+
+        const busyAudio = new Audio("busyaudio.mp3");
+        busyAudio.play().catch(err => console.warn("Busy audio failed:", err));
+
+        showStatus("All admins are busy.", "error", 3000);
+        disconnectCall();
+      }
+    });
+
+    connection.on("CallEnded", () => {
+      disconnectCallUI();
+      showStatus("Call ended.", "info", 3000);
+    });
+
+    endCallButton.onclick = async () => {
+      await connection.invoke("EndCall", "admin");
+      disconnectCallUI();
+    };
+
+    function disconnectCallUI() {
+      if (ringingAudio) ringingAudio.pause();
+      stopCallTimer();
+      loadingIndicator.style.display = "none";
+      videoContainer.style.display = "none";
+      callButton.disabled = false;
+      callButton.style.display = "inline-block";
+      endCallButton.style.display = "none";
+      if (peerConnection) {
+        peerConnection.close();
+        peerConnection = null;
+      }
+    }
+
+    connection.start().then(() => {
+      console.log("Connected to SignalR:", connection.connectionId);
+    }).catch(err => {
+      showStatus("Connection failed.", "error");
+    });
+  </script>
+</body>
+</html>
